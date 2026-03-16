@@ -171,7 +171,7 @@ def score_candidates(candidate_tensors: List[torch.Tensor], text_prompt: str, ve
                             
                         except Exception as e:
                             logger.error(f"Error scoring candidate {i} with {verifier_name}: {str(e)}")
-                            logger.debug(traceback.format_exc())
+                            logger.error(traceback.format_exc())
                             raw_scores_list[i][verifier_name] = float('-inf')
                             
             except Exception as e:
@@ -558,21 +558,77 @@ class LoadQwenVLMVerifier:
 
 
 class CLIPScoreVerifier:
+    CHUNK_SIZE = 75  # usable tokens per chunk (77 minus BOS + EOS)
+
     def __init__(self, model, processor, device):
         self.model = model
         self.processor = processor
         self.device = device
+        self.tokenizer = processor.tokenizer
+        self.bos_id = self.tokenizer.bos_token_id
+        self.eos_id = self.tokenizer.eos_token_id
+        self.pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+
+    def _encode_image(self, pil_img):
+        """Encode a PIL image into a normalized embedding."""
+        inputs = self.processor(images=pil_img, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(self.device)
+        image_emb = self.model.get_image_features(pixel_values=pixel_values)
+        return F.normalize(image_emb, dim=-1)
+
+    def _encode_text_chunked(self, text_prompt):
+        """Encode text into a normalized embedding, chunking if > 77 tokens."""
+        token_ids = self.tokenizer(
+            text_prompt, add_special_tokens=False, return_tensors="pt"
+        ).input_ids[0]
+
+        # Short prompt — fast path, no chunking needed
+        if len(token_ids) <= self.CHUNK_SIZE:
+            inputs = self.processor(
+                text=[text_prompt], return_tensors="pt", padding=True, truncation=True
+            )
+            input_ids = inputs["input_ids"].to(self.device)
+            attention_mask = inputs["attention_mask"].to(self.device)
+            text_emb = self.model.get_text_features(input_ids, attention_mask=attention_mask)
+            return F.normalize(text_emb, dim=-1)
+
+        # Long prompt — split into overlapping chunks
+        overlap = 10
+        stride = self.CHUNK_SIZE - overlap
+        chunk_embeddings = []
+
+        for start in range(0, len(token_ids), stride):
+            chunk = token_ids[start : start + self.CHUNK_SIZE]
+
+            # Wrap with BOS/EOS
+            ids = torch.cat([
+                torch.tensor([self.bos_id]),
+                chunk,
+                torch.tensor([self.eos_id]),
+            ]).unsqueeze(0)
+
+            # Pad to 77
+            pad_len = 77 - ids.shape[1]
+            if pad_len > 0:
+                ids = torch.cat([ids, torch.full((1, pad_len), self.pad_id)], dim=1)
+
+            attention_mask = (ids != self.pad_id).long()
+
+            ids = ids.to(self.device)
+            attention_mask = attention_mask.to(self.device)
+
+            emb = self.model.get_text_features(ids, attention_mask=attention_mask)
+            chunk_embeddings.append(emb)
+
+        # Average all chunk embeddings and normalize
+        stacked = torch.cat(chunk_embeddings, dim=0)  # (num_chunks, embed_dim)
+        avg_emb = stacked.mean(dim=0, keepdim=True)
+        return F.normalize(avg_emb, dim=-1)
 
     def score(self, text_prompt, pil_img):
-        # Prepare inputs and move to the correct device
-        inputs = self.processor(text=[text_prompt], images=pil_img, return_tensors="pt", padding=True)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        # Compute features
-        text_emb = self.model.get_text_features(inputs["input_ids"], attention_mask=inputs["attention_mask"])
-        image_emb = self.model.get_image_features(pixel_values=inputs["pixel_values"])
-        # Normalize and compute cosine similarity
-        text_emb = F.normalize(text_emb, dim=-1)
-        image_emb = F.normalize(image_emb, dim=-1)
+        """Compute cosine similarity between text and image via CLIP, with chunked encoding for long prompts."""
+        text_emb = self._encode_text_chunked(text_prompt)
+        image_emb = self._encode_image(pil_img)
         return F.cosine_similarity(text_emb, image_emb).item()
 
 
