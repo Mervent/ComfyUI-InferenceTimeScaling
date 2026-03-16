@@ -188,6 +188,77 @@ def rank_from_raw_scores(raw_scores_list):
     return rank_candidates(results_by_verifier, num_candidates)
 
 
+class ImageEvaluator:
+    """Evaluates image(s) against a text prompt using loaded verifiers, without any image generation."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Image or batch of images to evaluate."}),
+                "text_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Text prompt to score the image against."}),
+            },
+            "optional": {
+                "loaded_clip_score_verifier": ("CS_VERIFIER", {"tooltip": "CLIP score verifier instance."}),
+                "loaded_image_reward_verifier": ("IR_VERIFIER", {"tooltip": "ImageReward verifier instance."}),
+                "loaded_qwen_verifier": ("QWN_VERIFIER", {"tooltip": "Qwen VLM verifier instance."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "FLOAT", "STRING")
+    RETURN_NAMES = ("image", "score", "scores_json")
+    OUTPUT_TOOLTIPS = ("Best image (passthrough for single, best-ranked for batch).",
+                       "Primary score (average across active verifiers).",
+                       "Full per-verifier score breakdown as JSON.")
+    FUNCTION = "execute"
+    CATEGORY = "InferenceTimeScaling"
+    DESCRIPTION = (
+        "Scores an existing image (or batch) against a text prompt using CLIP, ImageReward, and/or Qwen verifiers. "
+        "No generation — wire this after any node that outputs IMAGE.\n\n"
+        "Single image: returns the image, its average score, and per-verifier breakdown.\n"
+        "Batch: returns the best-ranked image, its score, and full ranking JSON."
+    )
+
+    def execute(self, image, text_prompt, loaded_clip_score_verifier=None,
+                loaded_image_reward_verifier=None, loaded_qwen_verifier=None):
+        verifiers = {
+            "clip": loaded_clip_score_verifier,
+            "image_reward": loaded_image_reward_verifier,
+            "qwen_vlm_verifier": loaded_qwen_verifier,
+        }
+        active_verifiers = {k: v for k, v in verifiers.items() if v is not None}
+        if not active_verifiers:
+            raise ValueError("No verifiers connected — attach at least one verifier loader.")
+
+        # IMAGE tensor shape: [B, H, W, C]
+        batch_size = image.shape[0]
+        candidate_tensors = [image[i:i+1] for i in range(batch_size)]
+
+        logger.info(f"ImageEvaluator: scoring {batch_size} image(s) with {list(active_verifiers.keys())}")
+        raw_scores = score_candidates(candidate_tensors, text_prompt, active_verifiers)
+
+        if batch_size == 1:
+            scores = raw_scores[0]
+            avg_score = sum(scores.values()) / len(scores) if scores else 0.0
+            result = {"scores": scores, "average_score": avg_score}
+            return (image, avg_score, json.dumps(result, indent=2))
+
+        # Batch: rank and return the best
+        ranked = rank_from_raw_scores(raw_scores)
+        best_idx = ranked[0]["index"]
+        best_image = candidate_tensors[best_idx]
+        best_scores = raw_scores[best_idx]
+        avg_score = sum(best_scores.values()) / len(best_scores) if best_scores else 0.0
+
+        result = {
+            "best_index": best_idx,
+            "best_scores": best_scores,
+            "best_average_score": avg_score,
+            "ranking": ranked,
+        }
+        return (best_image, avg_score, json.dumps(result, indent=2))
+
+
 class InferenceTimeScaler:
 
     @classmethod
@@ -568,12 +639,14 @@ class LoadImageRewardVerifier:
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "InferenceTimeScaler": InferenceTimeScaler,
+    "ImageEvaluator": ImageEvaluator,
     "LoadQwenVLMVerifier": LoadQwenVLMVerifier,
     "LoadCLIPScoreVerifier": LoadCLIPScoreVerifier,
     "LoadImageRewardVerifier": LoadImageRewardVerifier
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "InferenceTimeScaler": "Inference Time Scaler",
+    "ImageEvaluator": "Image Evaluator",
     "LoadQwenVLMVerifier": "Load Qwen VLM Verifier",
     "LoadCLIPScoreVerifier": "Load CLIPScore Verifier",
     "LoadImageRewardVerifier": "Load ImageReward Verifier"
