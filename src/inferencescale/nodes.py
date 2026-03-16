@@ -4,7 +4,6 @@ import os
 import traceback
 from typing import Dict, List, Optional, Tuple, Any
 
-import ImageReward as reward
 import torch
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
@@ -18,9 +17,7 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 import latent_preview
-# from comfy.utils import ProgressBar
 
-from .qwen_verifier import QwenVLMVerifier
 from .utils import generate_neighbors
 
 logging.basicConfig(
@@ -28,6 +25,22 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('inferencescale')
+
+try:
+    import ImageReward as reward
+    HAS_IMAGE_REWARD = True
+except ImportError:
+    reward = None
+    HAS_IMAGE_REWARD = False
+    logger.warning("ImageReward not installed — Load ImageReward Verifier node will be unavailable.")
+
+try:
+    from .qwen_verifier import QwenVLMVerifier
+    HAS_QWEN = True
+except ImportError:
+    QwenVLMVerifier = None
+    HAS_QWEN = False
+    logger.warning("QwenVLMVerifier unavailable — install outlines + qwen2-vl deps to enable.")
 
 
 def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0,
@@ -530,6 +543,8 @@ class LoadQwenVLMVerifier:
     DESCRIPTION = "Loads the Qwen VLM verifier model. Downloads it if necessary."
 
     def execute(self, qwen_verifier_id, device, score_type):
+        if not HAS_QWEN:
+            raise ImportError("QwenVLMVerifier dependencies not installed. Run: pip install outlines qwen-vl-utils")
         # Construct a local comfyui checkpoint path for the model
         model_checkpoint = os.path.join(folder_paths.models_dir, "LLM", os.path.basename(qwen_verifier_id))
         if not os.path.exists(model_checkpoint):
@@ -626,6 +641,8 @@ class LoadImageRewardVerifier:
     DESCRIPTION = "Loads the ImageReward verifier model."
 
     def execute(self, ir_verifier_id, device):
+        if not HAS_IMAGE_REWARD:
+            raise ImportError("ImageReward package is not installed. Run: pip install image-reward")
         ir_model = reward.load(ir_verifier_id)
         try:
             ir_model.to(device)
